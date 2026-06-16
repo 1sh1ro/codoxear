@@ -1,0 +1,453 @@
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from codoxear import broker as broker_mod
+from codoxear.broker import Broker
+from codoxear.broker import SHELL_PRE_EXEC_MARKER
+from codoxear.broker import State
+from codoxear.broker import _agent_shell_command
+from codoxear.broker import _exec_agent_via_login_shell
+from codoxear.broker import _observe_shell_pre_exec_marker
+from codoxear.agent_backend import get_agent_backend
+from codoxear.util import append_launch_attempt
+from codoxear.util import read_launch_attempts
+
+
+def _broker_state(*, codex_pid: int, sock_path: Path) -> State:
+    return State(
+        codex_pid=codex_pid,
+        pty_master_fd=1,
+        cwd="/tmp",
+        start_ts=0.0,
+        codex_home=Path("/tmp"),
+        sessions_dir=Path("/tmp"),
+        sock_path=sock_path,
+    )
+
+
+class _AcceptCrashSocket:
+    def bind(self, _addr: str) -> None:
+        return
+
+    def listen(self, _backlog: int) -> None:
+        return
+
+    def settimeout(self, _timeout: float) -> None:
+        return
+
+    def accept(self) -> tuple[object, object]:
+        raise RuntimeError("boom")
+
+    def close(self) -> None:
+        return
+
+
+class _FakeThread:
+    started_targets: list[str] = []
+
+    def __init__(self, *, target, daemon: bool) -> None:
+        self._target = target
+        self._daemon = daemon
+
+    def start(self) -> None:
+        self.started_targets.append(self._target.__name__)
+
+
+class TestBrokerFailClosed(unittest.TestCase):
+    def test_login_shell_command_restores_tty_after_startup_before_exec(self) -> None:
+        cmd = _agent_shell_command(["codex", "--model", "gpt-5.4"], pty_slave_path="/dev/pts/19")
+
+        self.assertIn("exec ", cmd)
+        self.assertIn("/dev/pts/19", cmd)
+        self.assertIn("os.open(sys.argv[1], os.O_RDWR)", cmd)
+        self.assertIn("os.dup2(fd, target)", cmd)
+        self.assertIn(SHELL_PRE_EXEC_MARKER, cmd)
+        self.assertIn("codex --model gpt-5.4", cmd)
+        self.assertLess(cmd.index("os.dup2"), cmd.index("os.write"))
+        self.assertLess(cmd.index("os.write"), cmd.index("os.execvpe"))
+
+    def test_login_shell_argv_does_not_reject_shell_name(self) -> None:
+        with patch("codoxear.broker._user_shell", return_value="/bin/example-shell"):
+            argv = broker_mod._shell_argv_for_command("exec /bin/sh -c true")
+
+        self.assertEqual(argv, ["/bin/example-shell", "-l", "-i", "-c", "exec /bin/sh -c true"])
+
+    def test_web_login_shell_exec_uses_attach_trampoline(self) -> None:
+        calls: dict[str, object] = {}
+
+        def capture_exec(file: str, argv: list[str], env: dict[str, str]) -> None:
+            calls["file"] = file
+            calls["argv"] = argv
+            raise RuntimeError("stop")
+
+        with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.AGENT_BIN", "codex"), patch(
+            "codoxear.broker._user_shell", return_value="/bin/zsh"
+        ), patch("codoxear.broker.os.execvpe", side_effect=capture_exec):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                _exec_agent_via_login_shell(cwd=td, agent_args=["--model", "gpt-5.4"], pty_slave_path="/dev/pts/19")
+
+        self.assertEqual(calls["file"], "/bin/zsh")
+        argv = calls["argv"]
+        self.assertIsInstance(argv, list)
+        self.assertEqual(argv[:3], ["/bin/zsh", "-l", "-i"])
+        self.assertIn(SHELL_PRE_EXEC_MARKER, argv[-1])
+        self.assertIn("/dev/pts/19", argv[-1])
+
+    @unittest.skipUnless(shutil.which("zsh"), "zsh is required")
+    def test_web_startup_prompt_reaches_agent_exec_without_input(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            bin_dir = root / "bin"
+            home.mkdir()
+            bin_dir.mkdir()
+            fake_codex = bin_dir / "codex"
+            fake_codex.write_text("#!/bin/sh\necho FAKE_AGENT_STARTED rc=$RC_SECRET tty=$(test -t 0; echo $?)\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+            (home / ".zshrc").write_text(
+                """
+export RC_SECRET=from_rc
+printf "[startup] Would you like to continue? [Y/n] "
+read -r -k 1 option
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env.update(
+                {
+                    "HOME": str(home),
+                    "ZDOTDIR": str(home),
+                    "SHELL": shutil.which("zsh") or "zsh",
+                    "CODEX_BIN": str(fake_codex),
+                    "CODEX_WEB_OWNER": "web",
+                    "CODEX_WEB_SHELL_STARTUP_TIMEOUT_SECONDS": "2",
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                }
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "codoxear.broker", "--cwd", str(root), "--"],
+                cwd=Path(__file__).resolve().parent.parent,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+        self.assertIn("FAKE_AGENT_STARTED", proc.stdout)
+        self.assertIn("rc=from_rc", proc.stdout)
+        self.assertIn("tty=0", proc.stdout)
+        self.assertNotIn("Would you like to continue", proc.stdout)
+        self.assertNotIn("shell_startup", proc.stdout)
+
+    def test_shell_pre_exec_marker_detection_handles_split_chunks(self) -> None:
+        st = _broker_state(codex_pid=1234, sock_path=Path("/tmp/test-broker.sock"))
+        marker = SHELL_PRE_EXEC_MARKER.encode("utf-8")
+
+        _observe_shell_pre_exec_marker(st, b"prefix" + marker[:5], now_ts=1.0)
+        self.assertFalse(st.shell_pre_exec_marker_seen)
+        _observe_shell_pre_exec_marker(st, marker[5:] + b"suffix", now_ts=2.0)
+
+        self.assertTrue(st.shell_pre_exec_marker_seen)
+        self.assertEqual(st.shell_pre_exec_marker_ts, 2.0)
+
+    def test_shell_startup_watchdog_records_blocked_pre_exec_failure(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=[])
+        broker.state = _broker_state(codex_pid=1234, sock_path=Path("/tmp/test-broker.sock"))
+        broker.state.output_tail = "Update [Y/n] "
+        records: list[dict[str, object]] = []
+
+        with patch("codoxear.broker.OWNER_TAG", "web"), patch("codoxear.broker.SHELL_STARTUP_TIMEOUT_SECONDS", 0.5), patch(
+            "codoxear.broker._now", side_effect=[0.0, 1.0]
+        ), patch("codoxear.broker._record_launch_attempt", side_effect=lambda rec: records.append(rec)), patch.object(
+            broker, "_teardown_managed_process_group"
+        ) as teardown:
+            broker._shell_startup_watchdog()
+
+        self.assertEqual(records[0]["stage"], "shell_startup")
+        self.assertIn("did not reach agent exec", str(records[0]["error"]))
+        self.assertEqual(records[0]["pty_tail"], "Update [Y/n] ")
+        self.assertTrue(broker.state.prelog_failure_recorded)
+        teardown.assert_called_once_with()
+
+    def test_startup_output_watcher_records_pre_exec_tail(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=[])
+        read_fd, write_fd = os.pipe()
+        try:
+            broker.state = _broker_state(codex_pid=1234, sock_path=Path("/tmp/test-broker.sock"))
+            os.write(write_fd, b"[startup] prompt\n")
+            os.close(write_fd)
+            write_fd = -1
+
+            broker._startup_output_to_state(read_fd)
+            read_fd = -1
+
+            self.assertEqual(broker.state.output_tail, "[startup] prompt\n")
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
+    def test_broker_failure_record_preserves_prelog_user_messages(self) -> None:
+        now = 1_778_400_000.0
+        with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.OWNER_TAG", "web"), patch.object(
+            broker_mod, "LAUNCH_ATTEMPTS_PATH", Path(td) / "launches.jsonl"
+        ), patch("codoxear.util.now", return_value=now), patch("codoxear.broker.time.time", return_value=now + 1.0):
+            msg = {"text": "copy this", "ts": now + 0.5, "source": "send"}
+            append_launch_attempt(
+                {
+                    "launch_id": "launch-a",
+                    "state": "broker_meta_bound",
+                    "agent_backend": "codex",
+                    "cwd": "/tmp/work",
+                    "submitted_user_messages": [msg],
+                    "created_ts": now,
+                    "updated_ts": now,
+                },
+                path=broker_mod.LAUNCH_ATTEMPTS_PATH,
+            )
+            broker_mod._record_launch_attempt(
+                {
+                    "launch_id": "launch-a",
+                    "state": "failed",
+                    "stage": "agent_exit_before_log_bind",
+                    "error": "codex exited",
+                    "agent_backend": "codex",
+                    "cwd": "/tmp/work",
+                    "created_ts": now,
+                    "updated_ts": now + 1.0,
+                }
+            )
+            rows = read_launch_attempts(path=broker_mod.LAUNCH_ATTEMPTS_PATH, max_records=10, max_age_s=3600, now_ts=now + 2.0)
+
+        self.assertEqual(rows[0]["state"], "failed")
+        self.assertEqual(rows[0]["submitted_user_messages"][0]["text"], "copy this")
+
+    def test_shell_startup_watchdog_ignores_seen_marker(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=[])
+        broker.state = _broker_state(codex_pid=1234, sock_path=Path("/tmp/test-broker.sock"))
+        broker.state.shell_pre_exec_marker_seen = True
+
+        with patch("codoxear.broker.OWNER_TAG", "web"), patch("codoxear.broker._record_launch_attempt") as record:
+            broker._shell_startup_watchdog()
+
+        record.assert_not_called()
+
+    def test_pi_broker_injects_explicit_session_path_for_new_sessions(self) -> None:
+        fake_stdin = SimpleNamespace(isatty=lambda: False, fileno=lambda: 9)
+        with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.sys.stdin", fake_stdin), patch.dict(
+            "os.environ", {"PI_HOME": td, "CODEX_WEB_RESUME_SESSION_ID": ""}, clear=False
+        ), patch("codoxear.broker.AGENT_BACKEND", "pi"), patch("codoxear.broker.BACKEND", get_agent_backend("pi")):
+            broker = Broker(cwd="/tmp/pi-work", codex_args=["--model", "gpt-5.4"])
+
+        self.assertEqual(broker.codex_args[:2], ["--model", "gpt-5.4"])
+        self.assertEqual(broker.codex_args[-2], "--session")
+        session_path = Path(broker.codex_args[-1])
+        self.assertTrue(str(session_path).startswith(str(Path(td) / "agent" / "sessions" / "--tmp-pi-work--")))
+        self.assertIsNone(broker._resume_session_id)
+
+    def test_pi_discover_log_watcher_switches_when_new_log_appears_while_current_exists(self) -> None:
+        fake_stdin = SimpleNamespace(isatty=lambda: False, fileno=lambda: 9)
+        with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.sys.stdin", fake_stdin), patch.dict(
+            "os.environ", {"PI_HOME": td}, clear=False
+        ), patch("codoxear.broker.AGENT_BACKEND", "pi"), patch("codoxear.broker.BACKEND", get_agent_backend("pi")):
+            broker = Broker(cwd="/tmp", codex_args=[])
+            current = Path(td) / "current.jsonl"
+            current.write_text('{"type":"session","id":"current","cwd":"/tmp"}\n', encoding="utf-8")
+            new = Path(td) / "new.jsonl"
+            new.write_text('{"type":"session","id":"new","cwd":"/tmp"}\n', encoding="utf-8")
+            broker.state = _broker_state(codex_pid=1234, sock_path=Path(td) / "broker.sock")
+            broker.state.log_path = current
+            broker.state.known_rollout_paths = {current}
+            broker.state.sock_path = Path(td) / "broker.sock"
+            seen: list[Path] = []
+
+            def _capture_switch(*, log_path: Path) -> None:
+                seen.append(log_path)
+                broker._stop.set()
+
+            with patch("codoxear.broker._proc_find_open_rollout_log", return_value=new), patch.object(
+                broker, "_maybe_register_or_switch_rollout", side_effect=_capture_switch
+            ), patch("codoxear.broker.time.sleep", side_effect=lambda _seconds: None):
+                broker._discover_log_watcher()
+
+        self.assertEqual(seen, [new])
+
+    def test_teardown_managed_process_group_kills_real_process_group(self) -> None:
+        proc = subprocess.Popen(["sh", "-c", "sleep 100"], start_new_session=True)
+        try:
+            broker = Broker(cwd="/tmp", codex_args=[])
+            broker.state = _broker_state(codex_pid=proc.pid, sock_path=Path("/tmp/test-broker.sock"))
+
+            broker._teardown_managed_process_group(wait_seconds=0.2)
+
+            proc.wait(timeout=2.0)
+            self.assertIsNotNone(proc.returncode)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2.0)
+
+    def test_discover_log_watcher_failure_triggers_teardown(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=[])
+        broker.state = _broker_state(codex_pid=1234, sock_path=Path("/tmp/test-broker.sock"))
+
+        with patch("codoxear.broker._proc_find_open_rollout_log", side_effect=RuntimeError("boom")):
+            with patch.object(broker, "_teardown_managed_process_group") as teardown:
+                broker._discover_log_watcher()
+
+        teardown.assert_called_once_with()
+
+    def test_sock_server_accept_failure_triggers_teardown(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=[])
+        with tempfile.TemporaryDirectory() as td:
+            sock_root = Path(td)
+            broker.state = _broker_state(codex_pid=1234, sock_path=sock_root / "broker.sock")
+            with patch("codoxear.broker.SOCK_DIR", sock_root):
+                with patch("codoxear.broker.socket.socket", return_value=_AcceptCrashSocket()):
+                    with patch("codoxear.broker.os.chmod"):
+                        with patch.object(broker, "_teardown_managed_process_group") as teardown:
+                            broker._sock_server()
+
+        teardown.assert_called_once_with()
+
+    def test_web_owned_broker_forwards_local_stdin_when_tty_is_present(self) -> None:
+        fake_stdin = SimpleNamespace(isatty=lambda: True, fileno=lambda: 9)
+        _FakeThread.started_targets = []
+        with tempfile.TemporaryDirectory() as td:
+            broker = Broker(cwd=td, codex_args=[])
+            broker.sessions_dir = Path(td) / "sessions"
+            with patch("codoxear.broker.OWNER_TAG", "web"), patch("codoxear.broker.sys.stdin", fake_stdin), patch(
+                "codoxear.broker._require_proc"
+            ), patch("codoxear.broker._term_size", return_value=(24, 80)), patch(
+                "codoxear.broker.pty.openpty", return_value=(55, 56)
+            ), patch("codoxear.broker.os.ttyname", return_value="/dev/pts/test"), patch(
+                "codoxear.broker.os.pipe", return_value=(57, 58)
+            ), patch(
+                "codoxear.broker.os.fork", return_value=1234
+            ), patch("codoxear.broker._set_winsize"), patch(
+                "codoxear.broker.signal.signal"
+            ), patch("codoxear.broker.termios.tcgetattr", return_value=["saved"]), patch(
+                "codoxear.broker.termios.tcsetattr"
+            ), patch("codoxear.broker.tty.setraw"), patch(
+                "codoxear.broker.os.waitpid", return_value=(1234, 0)
+            ), patch(
+                "codoxear.broker.os.close"
+            ), patch.object(
+                broker, "_write_meta"
+            ), patch(
+                "codoxear.broker.threading.Thread", _FakeThread
+            ), patch(
+                "codoxear.broker._record_launch_attempt"
+            ):
+                broker._emulate_terminal = False
+                exit_code = broker.run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("_stdin_to_pty", _FakeThread.started_targets)
+
+    def test_web_owned_headless_broker_keeps_local_stdin_disabled_without_tty(self) -> None:
+        fake_stdin = SimpleNamespace(isatty=lambda: False, fileno=lambda: 9)
+        _FakeThread.started_targets = []
+        with tempfile.TemporaryDirectory() as td:
+            with patch("codoxear.broker.sys.stdin", fake_stdin):
+                broker = Broker(cwd=td, codex_args=[])
+            broker.sessions_dir = Path(td) / "sessions"
+            with patch("codoxear.broker.OWNER_TAG", "web"), patch("codoxear.broker.sys.stdin", fake_stdin), patch(
+                "codoxear.broker._require_proc"
+            ), patch("codoxear.broker._term_size", return_value=(24, 80)), patch(
+                "codoxear.broker.pty.openpty", return_value=(55, 56)
+            ), patch("codoxear.broker.os.ttyname", return_value="/dev/pts/test"), patch(
+                "codoxear.broker.os.pipe", return_value=(57, 58)
+            ), patch(
+                "codoxear.broker.os.fork", return_value=1234
+            ), patch("codoxear.broker._set_winsize"), patch(
+                "codoxear.broker.signal.signal"
+            ), patch(
+                "codoxear.broker.os.waitpid", return_value=(1234, 0)
+            ), patch(
+                "codoxear.broker.os.close"
+            ), patch.object(
+                broker, "_write_meta"
+            ), patch(
+                "codoxear.broker.threading.Thread", _FakeThread
+            ), patch(
+                "codoxear.broker._record_launch_attempt"
+            ):
+                exit_code = broker.run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("_stdin_to_pty", _FakeThread.started_targets)
+
+    def test_write_meta_tracks_resume_session_id(self) -> None:
+        broker = Broker(cwd="/tmp", codex_args=["resume", "resume-a"])
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = Path(td) / "broker.sock"
+            log_path = Path(td) / "rollout-2026-03-29T10-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+            log_path.write_text("", encoding="utf-8")
+            broker.state = _broker_state(codex_pid=1234, sock_path=sock_path)
+            broker.state.session_id = "broker-1"
+            broker.state.cwd = td
+            broker.state.log_path = log_path
+            broker.state.resume_session_id = "resume-a"
+
+            broker._write_meta()
+            meta_path = sock_path.with_suffix(".json")
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["resume_session_id"], "resume-a")
+
+            broker.state.resume_session_id = None
+            broker._write_meta()
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertIsNone(meta["resume_session_id"])
+
+    def test_pi_resume_run_binds_log_path_from_session_arg_before_first_write(self) -> None:
+        fake_stdin = SimpleNamespace(isatty=lambda: False, fileno=lambda: 9)
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.sys.stdin", fake_stdin), patch("codoxear.broker.AGENT_BACKEND", "pi"), patch(
+            "codoxear.broker.BACKEND", get_agent_backend("pi")
+        ):
+            log_path = Path(td) / "pi-resume.jsonl"
+            log_path.write_text('{"type":"session","id":"resume-a","cwd":"/tmp"}\n', encoding="utf-8")
+            expected_size = log_path.stat().st_size
+            broker = Broker(cwd="/tmp", codex_args=["--session", str(log_path)])
+            broker.sessions_dir = log_path.parent
+
+            def _capture_write_meta() -> None:
+                st = broker.state
+                captured["session_id"] = st.session_id if st else None
+                captured["log_path"] = str(st.log_path) if st and st.log_path else None
+                captured["log_off"] = st.log_off if st else None
+
+            with patch("codoxear.broker.OWNER_TAG", ""), patch("codoxear.broker._require_proc"), patch("codoxear.broker._term_size", return_value=(24, 80)), patch(
+                "codoxear.broker.pty.fork", return_value=(1234, 55)
+            ), patch("codoxear.broker._set_winsize"), patch(
+                "codoxear.broker.signal.signal"
+            ), patch(
+                "codoxear.broker.os.waitpid", return_value=(1234, 0)
+            ), patch(
+                "codoxear.broker.os.close"
+            ), patch.object(
+                broker, "_write_meta", side_effect=_capture_write_meta
+            ), patch(
+                "codoxear.broker.threading.Thread", _FakeThread
+            ):
+                broker.run()
+
+        self.assertEqual(captured["session_id"], "resume-a")
+        self.assertEqual(captured["log_path"], str(log_path))
+        self.assertEqual(captured["log_off"], expected_size)
+
+
+if __name__ == "__main__":
+    unittest.main()
